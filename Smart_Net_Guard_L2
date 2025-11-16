@@ -1,0 +1,1141 @@
+#!/usr/bin/env python3
+# =============================================================================
+# SmartNetGuard · L2-trainer
+# - L2 training/evaluation on windowed data
+# - L1 is used ONLY for embeddings (SLA verification + extraction)
+# -----------------------------------------------------------------------------
+# What is L2 in this system?
+#   L2 is a "dual-input" window classifier (WINDOW_SIZE x F):
+#     1) Time series of normalized L2 features (Conv1D blocks)
+#     2) Embedding from L1 (bottleneck/En4) for the same window
+#   The output is the logits for the final attack classes.
+#
+# Where do we get features and embeddings?
+#   • L2 features: from trainval/test parquet files (tabular, by time rows).
+#   • L1 embedding: from a separate L1 "run" (run_* folder + preprocessing_config.json).
+#     We perform SLA checking: feature set consistency, standardizer, z-clip, and window_size.
+#
+# What metrics and artifacts?
+#   • During training: focal loss, accuracy; save the best model.
+#   • After: Val/test reports (strict/mixed) — classification_report, confusion, ROC AUC macro,
+#            temperature calibration (ECE/NLL), confidence histograms,
+#            F1 bar chart by classes, journal of eras.
+#
+# Data forms:
+#   Table df_*: shape (N_rows, F_all + ['label', ...])
+#   Feature set FEAT_NAMES: list[str] of length F (finite number of features)
+#   Windows X_ts: shape (N_windows, WINDOW_SIZE, F)
+#   Window labels y_*: shape (N_windows,), values 0..C-1
+#   Embeddings E*: shape (N_windows, emb_dim)
+# =============================================================================
+
+import os, sys, json, gc, random, importlib, types
+from pathlib import Path
+from datetime import datetime
+import numpy as np
+import pandas as pd
+
+os.environ.setdefault("KERAS_BACKEND", "tensorflow")  # single backend for compatibility
+
+from sklearn.metrics import (
+    classification_report, confusion_matrix, balanced_accuracy_score,
+    roc_auc_score, log_loss
+)
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import tensorflow as tf
+from tensorflow.keras import layers as KL
+from tensorflow.keras import models as KM
+from tensorflow.keras import callbacks as KC
+from tensorflow.keras import optimizers as KO
+from tensorflow.keras import regularizers as KR
+
+# ===================== DEFAULT PATHS ====================
+# Where are the parquet files with L2 data (trainval/test) located and where should artifacts be stored?
+# DEFAULT_L1_RUN — or the path to the run_* folder (where the model and preprocessing_config.json are located),
+# or a direct path to the .keras model L1.
+DEFAULT_TRAINVAL_PATH = r"C:\Users\farao\Desktop\Project Smart Net Guard\data_for_multiclasification-20250912T072326Z-1-001\for_l2\L2_trainval_ready_no_bruteforce.parquet"
+DEFAULT_TEST_PATH = r"C:\Users\farao\Desktop\Project Smart Net Guard\data_for_multiclasification-20250912T072326Z-1-001\for_l2\L2_test_ready_no_bruteforce.parquet"
+DEFAULT_OUTPUT_DIR = r"C:\Users\farao\Desktop\Project Smart Net Guard\L2_experiments\l2_dual_input_L2only"
+DEFAULT_L1_RUN = r"C:\Users\farao\Desktop\Project Smart Net Guard\L1_ready_for_working\run_04_09_2025_08-23-48-20250913T075816Z-1-001\run_04_09_2025_08-23-48"
+
+# ===================== HYPERS/CONSTANTS =====================
+# Basic L2 learning settings
+WINDOW_SIZE = 112  # window length T (must match L1 SLA)
+BATCH_SIZE = 256  # batch for tf.data
+EPOCHS = 40  # eras of learning
+RANDOM_SEED = 42
+TRAIN_FRAC_PER_CLASS = 0.80  # train share in trainval for each class
+
+# --- Optimization/regularization (for maximum L2) ---
+FOCAL_GAMMA = 1.0  # γ in focal loss (enhancement of complex examples)
+# class weights in focal loss (by CANONICAL_CLASS_ORDER)
+FOCAL_ALPHA = [1.0, 1.35, 1.45, 1.0]
+LABEL_SMOOTHING = 0.0  # not used (kept for compatibility)
+L2_WEIGHT = 2e-4  # L2-regularization on the head
+DROPOUT_HEAD = 0.25  # dropout in a fully connected head
+
+# --- Augmentations (2D (T,F)) ---
+# Augmentations are applied to the window's time matrix (WINDOW_SIZE x F)
+JITTER_STDDEV = 0.01  # white noise in features
+TIME_MASK_PROB = 0.25  # the probability of zeroing out a random continuous fragment in time
+TIME_MASK_MAX_FRAC = 0.20  # max. timestamps share under mask
+FEATURE_MASK_PROB = 0.15  # the probability of masking a random fraction of features across the entire window
+FEATURE_MASK_FRAC = 0.15  # proportion of features to suppress (0 → leave)
+
+# --- TRAIN sampling (balancing/window cleanliness control) ---
+# How many windows per class do we want approximately in training (after the purity filter and mix windows)
+TRAIN_TARGET_PER_CLASS_MAP = {"volumetric_flood": 7000, "http_flood": 9000, "bot": 10000, "portscan": 10000}
+TRAIN_PURE_FRACTION = 0.55  # the default proportion of "perfectly clean" windows in the sample
+TRAIN_MIX_MINFRAC = 0.75  # minimum cleanliness for "mixed" windows
+# clarification of quotas by class (making more clean ones for bot/http_flood)
+PURE_FRACTION_MAP = {"bot": 0.90, "http_flood": 0.90}
+MIX_MINFRAC_MAP = {"bot": 0.95, "http_flood": 0.95}
+
+# --- VAL/TEST Markup ---
+# Strict sampling: we take only very "clean" windows (>=98% of the dominant class)
+# Mixed: Allow windows with >=70% dominant class
+VALTEST_STRICT_MINFRAC = 0.98
+VALTEST_MIXED_MINFRAC = 0.70
+
+# --- Calibration (temperature only) ---
+# We "smooth" the logits by dividing them by T>0: softmax(z/T). The goal is to reduce miscalibration (ECE/NLL).
+CALIBRATION_OBJECTIVE = "ece"  # 'ece' | 'nll'
+TS_GRID = np.linspace(0.70, 1.30, 13)  # T-grid
+
+# --- Classes (canonical order, fixes class id) ---
+CANONICAL_CLASS_ORDER = ["volumetric_flood", "http_flood", "bot", "portscan"]
+
+# --- SLA L1 (what basic features does L1 expect as input) ---
+BASE_FEATURE_NAMES = [
+    "flow_duration", "tot_fwd_pkts", "totlen_fwd_pkts",
+    "fwd_pkt_len_max", "fwd_pkt_len_mean", "flow_iat_mean", "flow_pkts_per_sec"
+]
+# BWD feature candidates (if present, add derived)
+BWD_BASE_CANDIDATES = ["tot_bwd_pkts", "totlen_bwd_pkts", "bwd_pkt_len_max", "bwd_pkt_len_mean", "bwd_iat_mean"]
+
+# Matching labels to canons (converting aliases)
+CANON_LABEL_ALIASES = {
+    "ddos_volumetric_flood": "volumetric_flood", "dos_http_flood": "http_flood", "dos_slow_dos": "slow_dos",
+    "network_portscan": "portscan",
+    "volumetric_flood": "volumetric_flood", "http_flood": "http_flood", "slow_dos": "slow_dos", "bot": "bot",
+    "portscan": "portscan", "auth_bruteforce": "bruteforce"
+}
+NUMERIC_EPS = 1e-6  # epsilon for divisions/logs
+
+
+# =============================================================================
+# UTILITIES
+# =============================================================================
+def set_global_seed(seed=RANDOM_SEED):
+    """
+    Fixes randomness for reproducibility (Python/NumPy/TF).
+    """
+    random.seed(seed);
+    np.random.seed(seed);
+    tf.random.set_seed(seed)
+
+
+def detect_devices():
+    """
+    Prints devices and enables "soft" memory growth on the GPU.
+    If there is no GPU, it limits threads for the CPU.
+    """
+    print("Devices:", tf.config.list_physical_devices())
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        for g in gpus:
+            try:
+                tf.config.experimental.set_memory_growth(g, True)
+            except Exception:
+                pass
+        os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
+        print(f"GPU detected: {len(gpus)}")
+    else:
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        try:
+            tf.config.threading.set_intra_op_parallelism_threads(max(1, os.cpu_count() // 2))
+            tf.config.threading.set_inter_op_parallelism_threads(2)
+        except Exception:
+            pass
+        print("GPU not found - running on CPU.")
+
+
+def canonicalize_label(s: str) -> str:
+    """
+    Convert string labels to canonical names (lowercase + aliases).
+    """
+    s = str(s).strip().lower()
+    return CANON_LABEL_ALIASES.get(s, s)
+
+
+# =============================================================================
+# L2 features (derived feature engineering)
+# =============================================================================
+def compute_derived_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Creates additional features for L2 from the base fields.
+    Entrance:
+      df: DataFrame row-by-row by time. Required fields:
+          flow_duration, tot_fwd_pkts, totlen_fwd_pkts, fwd_pkt_len_max, fwd_pkt_len_mean,
+          flow_iat_mean, flow_pkts_per_sec (+ optional bwd fields from BWD_BASE_CANDIDATES)
+    Exit:
+      DataFrame with additional columns (leave label/other fields alone).
+    """
+    d = df.copy()
+    # Basic forward derivatives
+    d["fwd_bytes_per_sec"] = d["totlen_fwd_pkts"] / (d["flow_duration"] + NUMERIC_EPS)
+    d["fwd_bytes_per_pkt"] = d["totlen_fwd_pkts"] / (d["tot_fwd_pkts"] + NUMERIC_EPS)
+    d["pktlen_max_over_mean"] = d["fwd_pkt_len_max"] / (d["fwd_pkt_len_mean"] + NUMERIC_EPS)
+    d["consistency"] = d["flow_pkts_per_sec"] * d["flow_iat_mean"]  # sanity-sign: should be ~1 for a stable tick
+    d["fwd_pkts_per_sec"] = d["tot_fwd_pkts"] / (d["flow_duration"] + NUMERIC_EPS)
+    d["payload_sparsity"] = 1.0 - (d["fwd_bytes_per_pkt"] / (d["fwd_pkt_len_max"] + NUMERIC_EPS)).clip(0, 1)
+    d["log_tot_fwd_pkts"] = np.log1p(d["tot_fwd_pkts"].clip(lower=0))
+    d["log_totlen_fwd_pkts"] = np.log1p(d["totlen_fwd_pkts"].clip(lower=0))
+    # If there are inverse (bwd) - we consider symmetrical features and their relationships
+    if all(c in d.columns for c in BWD_BASE_CANDIDATES):
+        d["bwd_bytes_per_sec"] = d["totlen_bwd_pkts"] / (d["flow_duration"] + NUMERIC_EPS)
+        d["bwd_bytes_per_pkt"] = d["totlen_bwd_pkts"] / (d["tot_bwd_pkts"] + NUMERIC_EPS)
+        d["bwd_pkts_per_sec"] = d["tot_bwd_pkts"] / (d["flow_duration"] + NUMERIC_EPS)
+        d["ratio_bytes_per_sec_bwd_fwd"] = d["bwd_bytes_per_sec"] / (d["fwd_bytes_per_sec"] + NUMERIC_EPS)
+        d["ratio_pkts_per_sec_bwd_fwd"] = d["bwd_pkts_per_sec"] / (d["fwd_pkts_per_sec"] + NUMERIC_EPS)
+        d["ratio_bytes_per_pkt_bwd_fwd"] = d["bwd_bytes_per_pkt"] / (d["fwd_bytes_per_pkt"] + NUMERIC_EPS)
+    return d
+
+
+def get_all_feature_names(df_with_derived: pd.DataFrame):
+    """
+    Returns the final list of L2 features to train.
+    First, the basic set; then, all found bwd/ratio features, if present.
+    """
+    base = [
+        "flow_duration", "tot_fwd_pkts", "totlen_fwd_pkts", "fwd_pkt_len_max", "fwd_pkt_len_mean",
+        "flow_iat_mean", "flow_pkts_per_sec", "fwd_bytes_per_sec", "fwd_bytes_per_pkt", "pktlen_max_over_mean",
+        "consistency", "fwd_pkts_per_sec", "payload_sparsity", "log_tot_fwd_pkts", "log_totlen_fwd_pkts"
+    ]
+    extra = []
+    for c in [
+        "tot_bwd_pkts", "totlen_bwd_pkts", "bwd_pkt_len_max", "bwd_pkt_len_mean", "bwd_iat_mean",
+        "bwd_bytes_per_sec", "bwd_bytes_per_pkt", "bwd_pkts_per_sec",
+        "ratio_bytes_per_sec_bwd_fwd", "ratio_pkts_per_sec_bwd_fwd", "ratio_bytes_per_pkt_bwd_fwd"
+    ]:
+        if c in df_with_derived.columns: extra.append(c)
+    return base + extra
+
+
+def split_train_val_per_class(df: pd.DataFrame, train_frac=TRAIN_FRAC_PER_CLASS):
+    """
+    Divides the total trainval by train/val separately for each class to maintain balance.
+    Entrance:
+      df: DataFrame with column 'label' (canonical names)
+      train_frac: fraction of trains within each class (0..1)
+    Exit:
+      train_df, val_df
+    """
+    parts_train, parts_val = [], []
+    for cname in CANONICAL_CLASS_ORDER:
+        sub = df[df["label"] == cname]
+        if len(sub) == 0: continue
+        ntr = int(round(len(sub) * float(train_frac)))
+        parts_train.append(sub.iloc[:ntr]);
+        parts_val.append(sub.iloc[ntr:])
+    train_df = pd.concat(parts_train, axis=0).reset_index(drop=True)
+    val_df = pd.concat(parts_val, axis=0).reset_index(drop=True)
+    return train_df, val_df
+
+
+# =============================================================================
+# WINDOW utils — window construction and cleanliness statistics
+# =============================================================================
+def build_windows_by_indices(matrix_2d_float32, start_indices, window_size):
+    """
+    Builds a 3D window tensor based on a list of starting indices.
+    Entrance:
+      matrix_2d_float32: np.ndarray(N_rows, F) — matrix of features by time
+      start_indices: np.ndarray/list of length B — start of each cut
+      window_size: int — the length of the window T
+    Exit:
+      np.ndarray (B, T, F)
+    """
+    if len(start_indices) == 0:
+        return np.zeros((0, window_size, matrix_2d_float32.shape[1]), dtype=np.float32)
+    return np.stack([matrix_2d_float32[i:i + window_size, :] for i in start_indices], axis=0).astype(np.float32)
+
+
+def rolling_label_stats(label_ids: np.ndarray, num_classes: int, window_size: int):
+    """
+    Calculates the dominant class and its “purity” (share) within the window using a sliding window.
+    Entrance:
+      label_ids : np.ndarray (N_rows,) — class IDs by time (0..C-1)
+      num_classes: int — C
+      window_size: int — T
+    Exit:
+      dom : np.ndarray (N_rows-T+1,) — dominant window class
+      purity: np.ndarray (N_rows-T+1,) — the proportion of the dominant class in the window [0..1]
+    """
+    win = np.ones(window_size, dtype=np.int32)
+    counts = []
+    for c in range(num_classes):
+        b = (label_ids == c).astype(np.int32)
+        cnt = np.convolve(b, win, mode='valid')  # sliding amount
+        counts.append(cnt)
+    counts = np.stack(counts, axis=1)  # (Nw, C)
+    dom = counts.argmax(axis=1)  # (Nw,)
+    purity = counts.max(axis=1) / float(window_size)
+    return dom.astype(np.int32), purity.astype(np.float32)
+
+
+# =============================================================================
+# L1 Loading + SLA - Preprocessing Compatibility and Embedding Extraction
+# =============================================================================
+def _patch_keras_functional_alias():
+    """
+    Helper shim for different Keras versions (Functional namespace compatibility).
+    It  fixes the import mismatch.
+    """
+    try:
+        import keras
+        try:
+            importlib.import_module("keras.src.models.functional");
+            return
+        except Exception:
+            pass
+        try:
+            from keras.src.engine.functional import Functional as _F
+        except Exception:
+            from keras.engine.functional import Functional as _F
+        mod = types.ModuleType("keras.src.models.functional")
+        mod.Functional = _F
+        sys.modules["keras.src.models.functional"] = mod
+    except Exception:
+        pass
+
+
+def _install_inputlayer_shim_global():
+    """
+    Patch for InputLayer argument incompatibility across revisions Keras/tf.keras.
+    Intercepts __init__ and overrides batch_shape -> batch_input_shape if necessary.
+    """
+
+    def _patch_class(cls, label):
+        try:
+            old_init = cls.__init__
+            if getattr(cls, "__sng_patched__", False): return
+
+            def new_init(self, *args, **kwargs):
+                if "batch_shape" in kwargs and "batch_input_shape" not in kwargs:
+                    bs = kwargs.pop("batch_shape")
+                    try:
+                        kwargs["batch_input_shape"] = tuple(bs)
+                    except Exception:
+                        pass
+                return old_init(self, *args, **kwargs)
+
+            cls.__init__ = new_init;
+            cls.__sng_patched__ = True
+        except Exception as e:
+            print(f"[Shim] skip {label}: {e!r}")
+
+    try:
+        import keras as k;
+        _patch_class(k.layers.InputLayer, "keras.layers")
+    except Exception:
+        pass
+    try:
+        _patch_class(tf.keras.layers.InputLayer, "tf.keras.layers")
+    except Exception:
+        pass
+    try:
+        from tensorflow.python.keras.engine import input_layer as tpel
+        _patch_class(tpel.InputLayer, "tf.python.keras.engine.input_layer")
+    except Exception:
+        pass
+    print("[Shim] InputLayer patched]")
+
+
+def _load_l1_model_robust(model_path: Path):
+    """
+    Reliable loading of L1 model from .keras (trying keras and tf.keras).
+    Return:
+      (model, backend_tag: 'keras'|'tf.keras')
+    """
+    try:
+        import keras as k
+        m = k.models.load_model(str(model_path), compile=False)
+        return m, "keras"
+    except Exception as e1:
+        try:
+            m = tf.keras.models.load_model(str(model_path), compile=False)
+            return m, "tf.keras"
+        except Exception as e2:
+            raise RuntimeError(f"Failed to load L1: keras={e1!r} | tf.keras={e2!r}")
+
+
+def find_l1_model_and_config(l1_input: Path):
+    """
+    Finds the path to the L1 model and preprocessing config.json.
+    Entrance:
+      l1_input: either the path to .keras or the run_* directory.
+    Exit:
+      (model_path: Path, config_path: Path)
+    Exceptions if not found.
+    """
+    if l1_input.is_file() and l1_input.suffix.lower() == ".keras":
+        model_path = l1_input
+        base_dir = model_path.parent if model_path.parent.name.lower() != "finetuned" else model_path.parent.parent
+        config_path = base_dir / "preprocessing_config.json"
+        if not config_path.exists():
+            raise FileNotFoundError(f"There is no preprocessing_config.json next to the model: {config_path}")
+        return model_path, config_path
+    l1_run_dir = l1_input
+    candidates = [
+        l1_run_dir / "finetuned" / "SmartNetGuard_DeepConv1D_AE_finetuned.keras",
+        l1_run_dir / "SmartNetGuard_DeepConv1D_AE.keras",
+    ]
+    model_path = None
+    for p in candidates:
+        if p.exists(): model_path = p; break
+    config_path = l1_run_dir / "preprocessing_config.json"
+    if model_path is None: raise FileNotFoundError(f"L1 model not found in {l1_run_dir}.")
+    if not config_path.exists(): raise FileNotFoundError(f"In {l1_run_dir} preprocessing_config.json is missing.")
+    return model_path, config_path
+
+
+def load_l1_and_make_head(model_path: Path, prefer_layer="Bottleneck_dense", fallback_layer="En4"):
+    """
+    Loads L1 and builds a "head" for embedding: input (T,F_L1) → vector (emb_dim,).
+    The default layer is Bottleneck Dense (Dense(8)); the spare layer is En4 (GAP on En4_conv).
+    Return:
+      (emb_head: KM.Model, emb_dim: int)
+    """
+    _patch_keras_functional_alias();
+    _install_inputlayer_shim_global()
+    l1_model, _ = _load_l1_model_robust(model_path)
+    try:
+        layer = l1_model.get_layer(prefer_layer)
+    except Exception:
+        layer = l1_model.get_layer(fallback_layer)
+        print(f" L1 layer '{prefer_layer}' not found, using '{fallback_layer}'.")
+    emb_head = KM.Model(inputs=l1_model.input, outputs=layer.output)
+    try:
+        emb_dim = int(emb_head.output_shape[-1])
+    except Exception:
+        dummy = np.zeros((1, WINDOW_SIZE, int(l1_model.input_shape[-1])), dtype=np.float32)
+        emb_dim = int(emb_head.predict(dummy, verbose=0).shape[-1])
+    print(f"[L1] embed layer: {layer.name}, dim={emb_dim}")
+    return emb_head, emb_dim
+
+
+def assert_sla_and_prepare_l1_preproc(config_path: Path, l2_base_feature_names):
+    """
+    SLA verification and L1 preprocessing parameter extraction:
+      - list of L1 features (must be a subset of columns in the L2 dataset),
+      - mean/scale standardizer,
+      - z-clip frames,
+      - window_size (must match).
+    Return:
+      (l1_feats: list[str], mean: np.ndarray[F], scale: np.ndarray[F], z_lo: float, z_hi: float)
+    """
+    cfg = json.load(open(config_path, "r", encoding="utf-8"))
+    l1_feats = cfg.get("feature_names", None)
+    if not l1_feats: raise ValueError("L1 does not have preprocessing_config.json 'feature_names'.")
+    if cfg.get("window_size", None) != WINDOW_SIZE:
+        raise ValueError(f"WINDOW_SIZE does not match (L1={cfg.get('window_size')} vs L2={WINDOW_SIZE}).")
+    missing = [c for c in l1_feats if c not in l2_base_feature_names]
+    if missing: raise ValueError(f"There are no L1 features in the L2 dataset: {missing}")
+    std = cfg.get("standardizer", {})
+    mean = np.array(std.get("mean", []), dtype=np.float32)
+    scale = np.array(std.get("scale", []), dtype=np.float32)
+    zclip = cfg.get("z_clip", [-8.0, 8.0])
+    print(f"[L1] preproc: feats={l1_feats}, z_clip={zclip}, mean/scale len={len(mean)}/{len(scale)}")
+    return l1_feats, mean, scale, float(zclip[0]), float(zclip[1])
+
+
+def standardize_for_l1(base2d_df: pd.DataFrame, l1_feature_names, mean, scale, lo_clip, hi_clip):
+    """
+    Converts the 2D matrix of L1 features to the form expected by L1:
+      X = (X - mean)/scale, then clip to [lo_clip, hi_clip].
+    Entrance:
+      base2d_df: DataFrame (N_rows, ...) — contains at least the l1_feature_names column
+    Exit:
+      np.ndarray (N_rows, len(l1_feature_names)), dtype float32
+    """
+    X = base2d_df[l1_feature_names].to_numpy(np.float32)
+    X = (X - mean.reshape(1, -1)) / (scale.reshape(1, -1) + 1e-12)
+    X = np.clip(X, lo_clip, hi_clip, out=X)
+    return X
+
+
+def compute_embeddings_for_windows(embedder, X_base_std_l1_2d, start_indices, window_size, batch=1024):
+    """
+    Computes L1 embeddings for a set of windows with given starts.
+    Entrance:
+      embedder      : KM.Model (T,F_L1)→(emb_dim,)
+      X_base_std_l1_2d: np.ndarray (N_rows, F_L1_std)
+      start_indices : np.ndarray of length B
+      window_size   : int (T)
+    Exit:
+      np.ndarray (B, emb_dim)
+    """
+    B = len(start_indices)
+    if B == 0: return np.zeros((0, int(embedder.output_shape[-1])), dtype=np.float32)
+    out = np.zeros((B, int(embedder.output_shape[-1])), dtype=np.float32)
+    cursor = 0
+    while cursor < B:
+        end = min(B, cursor + batch)
+        w = np.stack([X_base_std_l1_2d[i:i + window_size, :] for i in start_indices[cursor:end]], axis=0).astype(
+            np.float32)
+        out[cursor:end] = embedder.predict(w, verbose=0)
+        cursor = end
+        if (cursor // batch) % 50 == 0: gc.collect()
+    return out
+
+
+# =============================================================================
+# L2 Model - Dual Input (Conv1D by window + head by L1 embedding)
+# =============================================================================
+@tf.keras.utils.register_keras_serializable(name="SparseFocalLoss")
+class SparseFocalLoss(tf.keras.losses.Loss):
+    """
+    Focal loss for a "sparse" target (labels 0..C-1), with the option of alpha weights by class.
+    Parameters:
+      num_classes: C
+      gamma: γ in the formula (usually 1..2) - suppresses the contribution of "easy" examples
+      alpha: vector of class weights of length C or None
+      from_logits: if True, we treat y_pred as logits and apply softmax internally
+    Call: scalar loss (batch average).
+    """
+
+    def __init__(self, num_classes, gamma=2.0, alpha=None, from_logits=True, name="SparseFocalLoss"):
+        super().__init__(reduction="sum_over_batch_size", name=name)
+        self.num_classes = int(num_classes);
+        self.gamma = float(gamma)
+        self.alpha = None if alpha is None else tf.constant(alpha, dtype=tf.float32)
+        self.from_logits = bool(from_logits)
+
+    def call(self, y_true, y_pred):
+        y_true = tf.cast(y_true, tf.int32)
+        if self.from_logits: y_pred = tf.nn.softmax(y_pred, axis=-1)
+        y_true_oh = tf.one_hot(y_true, depth=self.num_classes)
+        p_t = tf.reduce_sum(y_true_oh * y_pred, axis=-1)  # probability of the true class
+        alpha_t = 1.0 if self.alpha is None else tf.gather(self.alpha, y_true)
+        loss = -alpha_t * tf.pow(1.0 - tf.clip_by_value(p_t, 1.0e-9, 1.0), self.gamma) \
+               * tf.math.log(tf.clip_by_value(p_t, 1.0e-9, 1.0))
+        return tf.reduce_mean(loss)
+
+
+def build_dual_input_model(input_shape_timeseries,
+                           input_dim_embedding,
+                           num_classes,
+                           dropout_rate=DROPOUT_HEAD,
+                           l2=L2_WEIGHT):
+    """
+    Builds an L2 classifier with two inputs:
+      • Input 1 (timeseries): Tensor (T,F) - passes Conv1D stack + GAP → vector
+      • Input 2 (embedding): Tensor (emb_dim,) - normalization + Dense
+      Then concatenation, MLP head, output logits (no softmax).
+    Arguments:
+      input_shape_timeseries: (T, F)
+      input_dim_embedding   : emb_dim (int)
+      num_classes           : C
+      dropout_rate, l2      : regularization
+    Return:
+      tf.keras.Model([inp_ts, inp_emb], logits)
+    """
+    reg = KR.l2(l2) if l2 and l2 > 0 else None
+
+    # Temporal path: several Conv1D (including dilated ones) → GAP
+    inp_ts = KL.Input(shape=input_shape_timeseries, name="timeseries_input")
+    x = KL.Conv1D(64, 5, padding="same", kernel_regularizer=reg)(inp_ts)
+    x = KL.BatchNormalization()(x);
+    x = KL.ReLU()(x);
+    x = KL.MaxPool1D(2)(x)
+    x = KL.Conv1D(128, 5, padding="same", kernel_regularizer=reg)(x)
+    x = KL.BatchNormalization()(x);
+    x = KL.ReLU()(x);
+    x = KL.MaxPool1D(2)(x)
+    for r in (1, 2, 4):
+        x = KL.Conv1D(128, 3, padding="same", dilation_rate=r, kernel_regularizer=reg)(x)
+        x = KL.BatchNormalization()(x);
+        x = KL.ReLU()(x)
+    x = KL.GlobalAveragePooling1D()(x)  # (None, 128)
+
+    #Embedding path L1: LN → Dense
+    inp_emb = KL.Input(shape=(input_dim_embedding,), name="l1_embedding_input")
+    e = KL.LayerNormalization()(inp_emb)
+    e = KL.Dense(64, activation="relu", kernel_regularizer=reg)(e)
+
+    # Merge + MLP head, no softmax (we work with logits, convenient for calibration)
+    h = KL.Concatenate(name="concat_ts_emb")([x, e])
+    h = KL.Dropout(dropout_rate)(h)
+    h = KL.Dense(128, activation="relu", kernel_regularizer=reg)(h)
+    h = KL.Dropout(dropout_rate)(h)
+    logits = KL.Dense(num_classes, name="Logits", kernel_regularizer=reg)(h)
+    return KM.Model([inp_ts, inp_emb], logits, name="SmartNetGuard_L2_DualInput")
+
+
+# =============================================================================
+# PLOTTING — services for charts/reports
+# =============================================================================
+def plot_and_save_curve(history_dict, out_path):
+    """
+    Saves learning curves: loss/val_loss, accuracy/val_accuracy (if any).
+    """
+    plt.figure(figsize=(7, 4))
+    if "loss" in history_dict:     plt.plot(history_dict["loss"], label="loss")
+    if "val_loss" in history_dict: plt.plot(history_dict["val_loss"], label="val_loss")
+    if "sparse_categorical_accuracy" in history_dict: plt.plot(history_dict["sparse_categorical_accuracy"], label="acc")
+    if "val_sparse_categorical_accuracy" in history_dict: plt.plot(history_dict["val_sparse_categorical_accuracy"],
+                                                                   label="val_acc")
+    plt.grid(True, ls="--", alpha=0.5);
+    plt.legend();
+    plt.tight_layout();
+    plt.savefig(out_path);
+    plt.close()
+
+
+def plot_confusion(cm, labels, out_path, normalize=True):
+    """
+    Draws the (normalized) error matrix and saves it to a file.
+    """
+    cm = np.array(cm, dtype=np.float32)
+    if normalize and cm.sum(axis=1, keepdims=True).min() > 0:
+        cm = cm / (cm.sum(axis=1, keepdims=True) + 1e-12)
+    plt.figure(figsize=(6, 5));
+    plt.imshow(cm, aspect='auto', interpolation='nearest')
+    plt.title("Confusion (norm)");
+    plt.colorbar()
+    plt.xticks(range(len(labels)), labels, rotation=45, ha='right');
+    plt.yticks(range(len(labels)), labels)
+    plt.tight_layout();
+    plt.savefig(out_path);
+    plt.close()
+
+
+def plot_confidence_hist(probs_max, out_path, title="Max softmax confidence"):
+    """
+    Maximum confidence histogram over a window (max softmax).
+    """
+    plt.figure(figsize=(7, 4));
+    plt.hist(probs_max, bins=50, alpha=0.9)
+    plt.title(title);
+    plt.xlabel("confidence");
+    plt.ylabel("count");
+    plt.grid(True, ls='--', alpha=0.5)
+    plt.tight_layout();
+    plt.savefig(out_path);
+    plt.close()
+
+
+def plot_bar(values_dict, title, out_path):
+    """
+    Universal bar chart (used for F1 classes).
+    """
+    names = list(values_dict.keys());
+    vals = [values_dict[k] for k in names]
+    plt.figure(figsize=(8, 4));
+    plt.bar(range(len(names)), vals)
+    plt.xticks(range(len(names)), names, rotation=45, ha='right');
+    plt.title(title);
+    plt.grid(True, ls="--", alpha=0.4)
+    plt.tight_layout();
+    plt.savefig(out_path);
+    plt.close()
+
+
+# =============================================================================
+# TRAIN Sampling: How to Choose Starting Window Indices for Training
+# =============================================================================
+def sample_train_windows_random_starts(df_train, window_size, seed,
+                                       target_per_class=TRAIN_TARGET_PER_CLASS_MAP,
+                                       pure_fraction=TRAIN_PURE_FRACTION,
+                                       mix_minfracs=TRAIN_MIX_MINFRAC):
+    """
+    Samples the starting window indices for train by class:
+      1) Calculates the dominant class and window purity (rolling_label_stats).
+      2) For each class, it takes a mixture of “pure” (purity==1.0) and “mixed” (purity>=mix_minfracs)
+         in proportion to pure_fraction (or refinements from *_MAP).
+      3)The target quantity is target_per_class[cname].
+    Return:
+      starts: np.ndarray (B,) — starting positions
+      y     : np.ndarray (B,) — y_id of window = dominant class
+      pur   : np.ndarray (B,) — purity of the dominant class
+      per_class_counts: dict — actually selected volumes by class
+    """
+    labels = df_train["label"].astype(str).map(canonicalize_label).values
+    cls2id = {c: i for i, c in enumerate(CANONICAL_CLASS_ORDER)}
+    y_ids = np.array([cls2id.get(s, -1) for s in labels], dtype=np.int32)
+    if (y_ids < 0).any(): raise ValueError("TRAIN contains labels outside of CANONICAL_CLASS_ORDER.")
+    y_dom, purity = rolling_label_stats(y_ids, len(CANONICAL_CLASS_ORDER), window_size)
+    starts_all = np.arange(0, len(labels) - window_size + 1, dtype=np.int64)
+    rng = np.random.default_rng(seed)
+
+    chosen_starts, chosen_y, chosen_purities, per_class_counts = [], [], [], {}
+    for cid, cname in enumerate(CANONICAL_CLASS_ORDER):
+        idx_pure = np.where((y_dom == cid) & (purity >= 1.0))[0]
+        pf = PURE_FRACTION_MAP.get(cname, pure_fraction)
+        mm = MIX_MINFRAC_MAP.get(cname, mix_minfracs)
+        idx_mix = np.where((y_dom == cid) & (purity >= mm) & (purity < 1.0))[0]
+
+        tpc = target_per_class.get(cname, target_per_class) if isinstance(target_per_class, dict) else target_per_class
+        n_target = min(int(tpc), len(idx_pure) + len(idx_mix))
+        # proportions of pure/mixed
+        n_pure_target = min(int(round(n_target * pf)), len(idx_pure))
+        n_mix_target = n_target - n_pure_target
+        if n_mix_target > len(idx_mix):
+            deficit = n_mix_target - len(idx_mix);
+            n_mix_target = len(idx_mix)
+            n_pure_target = min(n_pure_target + deficit, len(idx_pure))
+        elif n_pure_target > len(idx_pure):
+            deficit = n_pure_target - len(idx_pure);
+            n_pure_target = len(idx_pure)
+            n_mix_target = min(n_mix_target + deficit, len(idx_mix))
+        # selection without repetitions
+        pick_pure = rng.choice(idx_pure, size=n_pure_target, replace=False) if n_pure_target > 0 else np.array([],
+                                                                                                               dtype=int)
+        pick_mix = rng.choice(idx_mix, size=n_mix_target, replace=False) if n_mix_target > 0 else np.array([],
+                                                                                                           dtype=int)
+        pick = np.concatenate([pick_pure, pick_mix], axis=0)
+
+        chosen_starts.append(starts_all[pick])
+        chosen_y.append(np.full((pick.shape[0],), cid, dtype=np.int32))
+        chosen_purities.append(purity[pick])
+        per_class_counts[cname] = int(pick.shape[0])
+
+    starts = np.concatenate(chosen_starts, axis=0);
+    y = np.concatenate(chosen_y, axis=0)
+    pur = np.concatenate(chosen_purities, axis=0)
+    print("train windows per class (sampled):")
+    for c in CANONICAL_CLASS_ORDER: print(f"  {c:>18} : {per_class_counts.get(c, 0):>8,}")
+    print("-")
+    return starts, y, pur, per_class_counts
+
+
+# =============================================================================
+# VAL/TEST preparation – selection of windows based on cleanliness threshold
+# =============================================================================
+def prepare_eval_with_minfrac(df, window_size, min_frac):
+    """
+    Prepares windows for estimation from df, leaving windows where the dominant class covers
+    ≥ min_frac of the window fraction (or ==1.0).
+    Return:
+      kept_starts  : np.ndarray (B,)
+      kept_y       : np.ndarray (B,) — dominant window class
+      kept_purity  : np.ndarray (B,)
+    """
+    labels = df["label"].astype(str).map(canonicalize_label).values
+    cls2id = {c: i for i, c in enumerate(CANONICAL_CLASS_ORDER)}
+    y_ids = np.array([cls2id.get(s, -1) for s in labels], dtype=np.int32)
+    valid_mask = (y_ids >= 0);
+    y_ids = y_ids[valid_mask]
+    y_dom, purity = rolling_label_stats(y_ids, len(CANONICAL_CLASS_ORDER), window_size)
+    starts_all = np.arange(0, len(y_ids) - window_size + 1, dtype=np.int64)
+    keep = (purity == 1.0) | (purity >= float(min_frac))
+    kept_starts = starts_all[keep];
+    kept_y = y_dom[keep];
+    kept_purity = purity[keep]
+    return kept_starts, kept_y, kept_purity
+
+
+# =============================================================================
+# CALIBRATION (Temperature Scaling)
+# =============================================================================
+def _ece(y_true_ids, probs, n_bins=15):
+    """
+    Expected Calibration Error (ECE): the weighted average difference between precision and confidence
+    by confidence buckets [0..1]. The lower the ECE, the better the calibrated model.
+    """
+    y_true = np.asarray(y_true_ids, np.int32)
+    conf = probs.max(axis=1);
+    pred = probs.argmax(axis=1)
+    correct = (pred == y_true).astype(np.float32)
+    bins = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    for i in range(n_bins):
+        m = (conf >= bins[i]) & (conf < bins[i + 1])
+        if m.sum() == 0: continue
+        ece += abs(correct[m].mean() - conf[m].mean()) * (m.mean())
+    return float(ece)
+
+
+def fit_temperature_on_logits(y_true_ids, logits, grid, objective):
+    """
+    Selects the temperature T from the grid for softmax(z/T).
+    objective: 'ece' or 'nll' (log_loss). Returns (T_best, score_best).
+    """
+    best_T, best_score = 1.0, np.inf
+    for T in grid:
+        probs = tf.nn.softmax(logits / float(T), axis=1).numpy()
+        if objective == "ece":
+            score = _ece(y_true_ids, probs)
+        else:
+            score = log_loss(y_true_ids, probs, labels=list(range(probs.shape[1])))
+        if score < best_score: best_T, best_score = float(T), float(score)
+    return best_T, best_score
+
+
+def _pred_with_temperature(logits, temperature=None):
+    """
+    Applies the temperature (if given) and returns:
+      y_pred (argmax by logits or z/T), probs (softmax).
+    """
+    z = logits if temperature is None else logits / float(temperature)
+    probs = tf.nn.softmax(z, axis=1).numpy()
+    y_pred = np.argmax(z, axis=1)
+    return y_pred, probs
+
+
+def _try_load_calibration(out_dir: Path):
+    """
+    Attempts to read the stored temperature from calibration.json. Otherwise, None.
+    """
+    try:
+        obj = json.load(open(out_dir / "calibration.json", "r", encoding="utf-8"))
+        return float(obj.get("temperature", 1.0))
+    except Exception:
+        return None
+
+
+# =============================================================================
+# MAIN — full pipeline: loading → features → sampling → embeddings → training → evaluation → calibration → saving
+# =============================================================================
+def main(trainval_path: str = DEFAULT_TRAINVAL_PATH,
+         test_path: str = DEFAULT_TEST_PATH,
+         output_dir: str = DEFAULT_OUTPUT_DIR,
+         l1_run: str = DEFAULT_L1_RUN,
+         window_size: int = WINDOW_SIZE,
+         batch_size: int = BATCH_SIZE,
+         epochs: int = EPOCHS,
+         seed: int = RANDOM_SEED):
+    """
+    The main scenario is L2-only.
+    Input paths are parquet (trainval/test) with a 'label' column and basic features,
+    and also the path to L1 run_* (or to .keras) for SLA and embedding extraction.
+    """
+    print("=== L2-ONLY RUN (clean): ZD/Events/KPI/OOD — REMOVED ===")
+    set_global_seed(seed);
+    detect_devices()
+
+    # Launch directory
+    out_root = Path(output_dir);
+    out_root.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = out_root / f"run_{ts}_win{window_size}_seed{seed}";
+    out.mkdir(parents=False, exist_ok=False)
+    print(f"[Run dir] {out}")
+
+    # 1) Load
+    print("\n=== 1) Loading trainval & test ===")
+    df_tv_raw = pd.read_parquet(trainval_path);
+    df_te_raw = pd.read_parquet(test_path)
+    for df in (df_tv_raw, df_te_raw): df["label"] = df["label"].map(canonicalize_label)
+    # canonical class filter
+    df_tv_raw = df_tv_raw[df_tv_raw["label"].isin(CANONICAL_CLASS_ORDER)].reset_index(drop=True)
+    df_te_raw = df_te_raw[df_te_raw["label"].isin(CANONICAL_CLASS_ORDER)].reset_index(drop=True)
+    print(f"Rows trainval: {len(df_tv_raw):,} | test: {len(df_te_raw):,}")
+
+    # 2) Derived
+    print("\n=== 2) Computing derived features ===")
+    df_tv_all = compute_derived_features(df_tv_raw);
+    df_te_all = compute_derived_features(df_te_raw)
+    FEAT_NAMES = get_all_feature_names(df_tv_all)
+    print(f"Total features used ({len(FEAT_NAMES)}).")
+
+    # 3) Split per-class
+    print("\n=== 3) Splitting TRAIN/VAL per-class ===")
+    df_train, df_val = split_train_val_per_class(df_tv_all, TRAIN_FRAC_PER_CLASS);
+    df_test = df_te_all
+    print(f"Train rows={len(df_train):,} | Val rows={len(df_val):,} | Test rows={len(df_test):,}")
+
+    # 4) L2 clip/std on TRAIN
+    print("\n=== 4) Fitting clip & standardizer on TRAIN (L2) ===")
+    # Robust quantile clips (0.5%...99.5%) - reduce the influence of tails
+    clip_lo = df_train[FEAT_NAMES].quantile(0.005).to_dict()
+    clip_hi = df_train[FEAT_NAMES].quantile(0.995).to_dict()
+
+    def apply_clip(df):
+        d = df.copy()
+        for c in FEAT_NAMES: d[c] = d[c].clip(lower=clip_lo[c], upper=clip_hi[c])
+        return d
+
+    df_train = apply_clip(df_train);
+    df_val = apply_clip(df_val);
+    df_test = apply_clip(df_test)
+
+    # standardization by TRAIN (mu/std), ddof=0 — as in sklearn StandardScaler
+    mu = df_train[FEAT_NAMES].mean().to_dict()
+    sd = df_train[FEAT_NAMES].std(ddof=0).replace(0, 1.0).to_dict()
+
+    def apply_std(df):
+        d = df.copy()
+        for c in FEAT_NAMES:
+            s = sd[c] if sd[c] != 0 else 1.0
+            d[c] = (d[c] - mu[c]) / s
+        return d
+
+    df_train = apply_std(df_train);
+    df_val = apply_std(df_val);
+    df_test = apply_std(df_test)
+
+    # save preprocessing statistics
+    json.dump({"per_feature": {"low": clip_lo, "high": clip_hi}}, open(out / "clip_stats.json", "w", encoding="utf-8"),
+              indent=2)
+    json.dump({"mean": mu, "std": sd, "feature_names": FEAT_NAMES},
+              open(out / "scaler_stats.json", "w", encoding="utf-8"), indent=2)
+
+    # 5) Train windows — building indexes by class and collecting (B, T, F)
+    print("\n=== 5) Building TRAIN windows (class-conditional) ===")
+    tr_starts, ytr, purity_tr, per_class_counts = sample_train_windows_random_starts(
+        df_train, window_size, seed,
+        target_per_class=TRAIN_TARGET_PER_CLASS_MAP,
+        pure_fraction=TRAIN_PURE_FRACTION,
+        mix_minfracs=TRAIN_MIX_MINFRAC
+    )
+    Xtr_ts = build_windows_by_indices(df_train[FEAT_NAMES].to_numpy(np.float32), tr_starts, window_size)  # (B,T,F)
+
+    # 6) L1 SLA & embeddings — loading L1, checking the contract, calculating embeddings for train windows
+    print("\n=== 6) L1 contract (SLA) & embeddings ===")
+    l1_model_path, l1_config_path = find_l1_model_and_config(Path(l1_run))
+    l1_feats, l1_mean, l1_scale, zlo, zhi = assert_sla_and_prepare_l1_preproc(l1_config_path, BASE_FEATURE_NAMES)
+    emb_head, emb_dim = load_l1_and_make_head(l1_model_path)
+
+    # standardization of the L1 base for ALL train/val/test lines (according to SLA L1)
+    base_train_std = standardize_for_l1(df_train, l1_feats, l1_mean, l1_scale, zlo, zhi)
+    base_val_std = standardize_for_l1(df_val, l1_feats, l1_mean, l1_scale, zlo, zhi)
+    base_test_std = standardize_for_l1(df_test, l1_feats, l1_mean, l1_scale, zlo, zhi)
+
+    # Embeddings for train windows (match the windows of Xtr_ts)
+    L1tr_win = np.stack([base_train_std[i:i + window_size, :] for i in tr_starts], axis=0).astype(np.float32)
+    Etr = emb_head.predict(L1tr_win, verbose=0, batch_size=512)  # (B, emb_dim)
+    print(f"[L1→L2] Embeddings train: {Etr.shape}")
+
+    # 7) tf.data for TRAIN — with augmentations and sample_weights
+    print("\n=== 7) Building tf.data for TRAIN ===")
+    # class_weights — the inverse of the frequency, normalized to the number of classes
+    class_counts = np.bincount(ytr, minlength=len(CANONICAL_CLASS_ORDER)).astype(np.float32)
+    inv = 1.0 / np.clip(class_counts, 1.0, None);
+    class_weights = (inv * (len(CANONICAL_CLASS_ORDER) / inv.sum())).astype(np.float32)
+    # example weight = 0.5 + 0.5*purity (the cleaner the window, the higher the weight) × class weight
+    w_purity = 0.5 + 0.5 * purity_tr;
+    w_class = class_weights[ytr]
+    sample_weights = (w_purity * w_class).astype(np.float32)
+
+    F_STATIC = len(FEAT_NAMES)
+    AUTOTUNE = tf.data.AUTOTUNE
+
+    @tf.function
+    def _augment(ts):
+        """
+        Stochastic window augmentation ts (T,F): time mask / feature mask / jitter.
+        Return: a tensor of the same shape (WINDOW_SIZE, F_STATIC).
+        """
+        ts = tf.ensure_shape(ts, (WINDOW_SIZE, F_STATIC))
+        L = tf.shape(ts)[0];
+        D = tf.shape(ts)[1]
+
+        def time_mask_block(xi):
+            frac = tf.random.uniform([], 0.05, TIME_MASK_MAX_FRAC)
+            length = tf.maximum(1, tf.cast(tf.round(frac * tf.cast(L, tf.float32)), tf.int32))
+            start = tf.random.uniform([], 0, L - length + 1, dtype=tf.int32)
+            pre = tf.ones([start, D], xi.dtype);
+            mid = tf.zeros([length, D], xi.dtype);
+            post = tf.ones([L - start - length, D], xi.dtype)
+            return xi * tf.concat([pre, mid, post], axis=0)
+
+        def feature_mask_block(xi):
+            keep = tf.cast(tf.random.uniform([D]) > FEATURE_MASK_FRAC, xi.dtype)
+            return xi * tf.reshape(keep, [1, -1])
+
+        xj = ts
+        if tf.random.uniform(()) < TIME_MASK_PROB:   xj = time_mask_block(xj)
+        if tf.random.uniform(()) < FEATURE_MASK_PROB: xj = feature_mask_block(xj)
+        if JITTER_STDDEV and JITTER_STDDEV > 0:        xj = xj + tf.random.normal(tf.shape(xj),
+                                                                                  stddev=float(JITTER_STDDEV),
+                                                                                  dtype=xj.dtype)
+        return tf.ensure_shape(xj, (WINDOW_SIZE, F_STATIC))
+
+    ds_train = tf.data.Dataset.from_tensor_slices(((Xtr_ts, Etr), ytr, sample_weights)) \
+        .shuffle(min(10000, len(ytr)), seed=seed, reshuffle_each_iteration=True) \
+        .map(lambda feats, yy, ww: ((_augment(feats[0]), feats[1]), yy, ww), num_parallel_calls=AUTOTUNE) \
+        .batch(batch_size).prefetch(AUTOTUNE)
+
+    # 8) Model + optimizer + loss
+    print("\n=== 8) Building and compiling the dual-input model ===")
+    model = build_dual_input_model(
+        input_shape_timeseries=(window_size, len(FEAT_NAMES)),
+        input_dim_embedding=Etr.shape[1],
+        num_classes=len(CANONICAL_CLASS_ORDER),
+        dropout_rate=DROPOUT_HEAD, l2=L2_WEIGHT
+    )
+    if FOCAL_ALPHA and len(FOCAL_ALPHA) != len(CANONICAL_CLASS_ORDER):
+        raise ValueError(f"FOCAL_ALPHA expects {len(CANONICAL_CLASS_ORDER)} weights, got {len(FOCAL_ALPHA)}")
+
+    # cosine restart LR (if AdamW is available), otherwise Adam with fixed LR
+    steps_per_epoch = max(1, int(np.ceil(len(ytr) / batch_size)))
+    try:
+        lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
+            initial_learning_rate=5e-4, first_decay_steps=steps_per_epoch * 5, t_mul=2.0, m_mul=0.7, alpha=1e-4
+        )
+        optimizer = KO.AdamW(learning_rate=lr_schedule)
+    except Exception:
+        optimizer = KO.Adam(learning_rate=5e-4)
+
+    loss_fn = SparseFocalLoss(num_classes=len(CANONICAL_CLASS_ORDER),
+                              gamma=FOCAL_GAMMA, alpha=np.array(FOCAL_ALPHA, dtype=np.float32), from_logits=True)
+
+    model.compile(optimizer=optimizer, loss=loss_fn,
+                  metrics=[tf.keras.metrics.SparseCategoricalAccuracy(name="sparse_categorical_accuracy")])
+    model.summary()
+
+    # 9) VAL/TEST basic windows (strict/mixed) — prepare in advance
+    print("\n=== 9) Preparing VAL/TEST datasets (strict & mixed) ===")
+
+    def build_eval_ds_once(df_split, base_std, minfrac, tag):
+        """
+        For a given df_split:
+          - selects windows by the minfrac purity threshold,
+          - collects X_ts (T,F),
+          - returns the starting indices, window labels, and a reference to the 2D base for calculating embeddings (base_std).
+        """
+        starts, y_ids, _ = prepare_eval_with_minfrac(df_split, window_size, minfrac)
+        X_ts = build_windows_by_indices(df_split[FEAT_NAMES].to_numpy(np.float32), starts, window_size)
+        print(f"{tag}: total_windows={len(y_ids):,}")
+        return starts, y_ids, X_ts, base_std
+
+    vs_starts, yval_str_ids, Xvs_ts, vs_base = build_eval_ds_once(df_val, base_val_std, VALTEST_STRICT_MINFRAC,
+                                                                  "val_strict")
+    vm_starts, yval_mix_ids, Xvm_ts, vm_base = build_eval_ds_once(df_val, base_val_std, VALTEST_MIXED_MINFRAC,
+                                                                  "val_mixed")
+    ts_starts, ytes_str_ids, Xts_ts, ts_base = build_eval_ds_once(df_test, base_test_std, VALTEST_STRICT_MINFRAC,
+                                                                  "test_strict")
+    tm_starts, ytes_mix_ids, Xtm_ts, tm_base = build_eval_ds_once(df_test, base_test_std, VALTEST_MIXED_MINFRAC,
+                                                                  "test_mixed")
+
+    # 10) Training (validate against strict)
+    epoch_logger = KC.CSVLogger(out / "epoch_log.csv", append=False)
+    early_stop = KC.EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True, verbose=1)
+    ckpt = KC.ModelCheckpoint(out / "SmartNetGuard_L2_DualInput_best.keras", monitor="val_loss", save_best_only=True,
+                              verbose=1)
+
+    print("\n=== 10) Training ===")
+    # embeddings for strict validation during fit()
+    Xvs_E = compute_embeddings_for_windows(emb_head, vs_base, vs_starts, window_size)
+    ds_val_str_for_fit = tf.data.Dataset.from_tensor_slices(((Xvs_ts, Xvs_E), yval_str_ids)).batch(batch_size)
+
+    history = model.fit(ds_train, epochs=epochs, validation_data=ds_val_str_for_fit,
+                        callbacks=[epoch_logger, early_stop, ckpt], verbose=1)
+
+    json.dump({k: [float(x) for x in v] for k, v in history.history.items()},
+              open(out / "history.json", "w", encoding="utf-8"), indent=2)
+    plot_and_save_curve(history.history, out / "curve_loss.png")
+    del ds_val_str_for_fit;
+    gc.collect()
+
+    # 11) Evaluation + Calibration (Temperature Scaling)
+    print("\n=== 11) Evaluation (VAL & TEST; strict & mixed) ===")
+
+    def eval_and_dump_basic(name, logits, y_true, apply_calib=True, return_probs=False):
+        """
+        Unified rating: applies stored temperature (if needed),
+        Builds reports/graphs, returns accuracy/balanced_acc/rocauc_macro.
+        """
+        T_use = _try_load_calibration(out) if apply_calib else None
+        y_pred, probs = _pred_with_temperature(logits, temperature=T_use)
+
+        C = len(CANONICAL_CLASS_ORDER)
+        rep = classification_report(y_true, y_pred, labels=list(range(C)), target_names=CANONICAL_CLASS_ORDER, digits=4,
+                                    output_dict=True, zero_division=0)
+        cm = confusion_matrix(y_true, y_pred, labels=list(range(C))).tolist()
+        json.dump({"classification_report": rep, "confusion_matrix": cm},
+                  open(out / f"metrics_{name}.json", "w", encoding="utf-8"), indent=2)
+
+        acc = float((np.array(y_true) == y_pred).mean())
+        bal_acc = float(balanced_accuracy_score(y_true, y_pred))
+        try:
+            rocauc_macro = float(roc_auc_score(y_true, probs, multi_class="ovr", average="macro"))
+        except Exception:
+            rocauc_macro = None
+
+        plot_confusion(cm, CANONICAL_CLASS_ORDER, out / f"confusion_{name}.png", normalize=True)
+        per_class_f1 = {k: float(rep[k]["f1-score"]) for k in CANONICAL_CLASS_ORDER}
+        plot_bar(per_class_f1, f"F1 by class ({name})", out / f"f1_by_class_{name}.png")
+        plot_confidence_hist(probs.max(axis=1), out / f"hist_confidence_{name}.png",
+                             title=f"Max softmax confidence ({name})")
+
+        print(f"[{name}] accuracy={acc:.4f} | balanced_acc={bal_acc:.4f} | rocauc_macro={rocauc_macro}")
+        return acc, bal_acc, rocauc_macro, (probs if return_probs else None)
+
+    # val_strict (without calibration - benchmark before TS)
+    logits_vs = model.predict(tf.data.Dataset.from_tensor_slices(((Xvs_ts, Xvs_E), yval_str_ids)).batch(batch_size),
+                              verbose=0)
+    acc_vs, bal_vs, auc_vs, _ = eval_and_dump_basic("val_strict", logits_vs, yval_str_ids, apply_calib=False)
+
+    # val_mixed → select temperature (ECE/NLL), save calibration.json
+    Xvm_E = compute_embeddings_for_windows(emb_head, vm_base, vm_starts, window_size)
+    logits_vm = model.predict(tf.data.Dataset.from_tensor_slices(((Xvm_ts, Xvm_E), yval_mix_ids)).batch(batch_size),
+                              verbose=0)
+    T_best, _ = fit_temperature_on_logits(yval_mix_ids, logits_vm, grid=TS_GRID, objective=CALIBRATION_OBJECTIVE)
+    json.dump({"temperature": float(T_best)}, open(out / "calibration.json", "w", encoding="utf-8"), indent=2)
+    print(f"[Calibration] T={T_best:.2f}")
+    _, _, _, _ = eval_and_dump_basic("val_mixed", logits_vm, yval_mix_ids, apply_calib=True, return_probs=True)
+
+    # 12) Test strict/mixed (using calibration)
+    print("\n=== 12) Test ===")
+    Xts_E = compute_embeddings_for_windows(emb_head, ts_base, ts_starts, window_size)
+    logits_ts = model.predict(tf.data.Dataset.from_tensor_slices(((Xts_ts, Xts_E), ytes_str_ids)).batch(batch_size),
+                              verbose=0)
+    eval_and_dump_basic("test_strict", logits_ts, ytes_str_ids, apply_calib=True)
+
+    Xtm_E = compute_embeddings_for_windows(emb_head, tm_base, tm_starts, window_size)
+    logits_tm = model.predict(tf.data.Dataset.from_tensor_slices(((Xtm_ts, Xtm_E), ytes_mix_ids)).batch(batch_size),
+                              verbose=0)
+    eval_and_dump_basic("test_mixed", logits_tm, ytes_mix_ids, apply_calib=True)
+
+    # Saving the model and summary "passport" information about the launch
+    model.save(out / "SmartNetGuard_L2_DualInput_last.keras")
+    json.dump({
+        "trainval_path": trainval_path, "test_path": test_path, "output_dir": str(out), "l1_run": str(Path(l1_run)),
+        "window_size": int(window_size), "class_order": CANONICAL_CLASS_ORDER, "features_l2": FEAT_NAMES,
+        "train_sampling": {"quotas": TRAIN_TARGET_PER_CLASS_MAP, "pure_fraction": float(TRAIN_PURE_FRACTION),
+                           "mix_minfrac": float(TRAIN_MIX_MINFRAC),
+                           "maps": {"pure": PURE_FRACTION_MAP, "mix_minfracs": MIX_MINFRAC_MAP}},
+        "augment": {"time_mask_prob": TIME_MASK_PROB, "time_mask_max_frac": TIME_MASK_MAX_FRAC,
+                    "feature_mask_prob": FEATURE_MASK_PROB, "feature_mask_frac": FEATURE_MASK_FRAC,
+                    "jitter_stddev": JITTER_STDDEV},
+        "optimizer": "AdamW+CosineDecayRestarts",
+        "loss": ("focal", {"gamma": FOCAL_GAMMA, "alpha": FOCAL_ALPHA}),
+        "l2_weight": float(L2_WEIGHT), "dropout_head": float(DROPOUT_HEAD)
+    }, open(out / "summary.json", "w", encoding="utf-8"), indent=2)
+
+    print("\n=== DONE (L2-only clean) ===")
+    print(f"Artifacts → {out}")
+
+
+# =============================================================================
+# ENTRY — CLI
+# =============================================================================
+if __name__ == "__main__":
+
+    IN_IPY = "ipykernel" in sys.modules
+    if IN_IPY:
+        main(DEFAULT_TRAINVAL_PATH, DEFAULT_TEST_PATH, DEFAULT_OUTPUT_DIR, DEFAULT_L1_RUN)
+    else:
+        import argparse
+
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--trainval", default=DEFAULT_TRAINVAL_PATH,
+                        help="Parquet with train+val, row by row by time (column 'label' is required)")
+        ap.add_argument("--test", default=DEFAULT_TEST_PATH,
+                        help="Parquet with test, row by row by time (column 'label' is required)")
+        ap.add_argument("--outdir", default=DEFAULT_OUTPUT_DIR, help="Where to write launch artifacts")
+        ap.add_argument("--l1_run", default=DEFAULT_L1_RUN, help="Path to run_* folder or directly to L1 .keras")
+        ap.add_argument("--window", type=int, default=WINDOW_SIZE, help="Window length (must match L1)")
+        ap.add_argument("--batch_size", type=int, default=BATCH_SIZE, help="Batch size")
+        ap.add_argument("--epochs", type=int, default=EPOCHS, help="Epochs")
+        ap.add_argument("--seed", type=int, default=RANDOM_SEED, help="Random seed")
+        args = ap.parse_args()
+        main(args.trainval, args.test, args.outdir, args.l1_run, args.window, args.batch_size, args.epochs, args.seed)
