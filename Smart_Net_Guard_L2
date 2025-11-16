@@ -58,10 +58,10 @@ from tensorflow.keras import regularizers as KR
 # Where are the parquet files with L2 data (trainval/test) located and where should artifacts be stored?
 # DEFAULT_L1_RUN — or the path to the run_* folder (where the model and preprocessing_config.json are located),
 # or a direct path to the .keras model L1.
-DEFAULT_TRAINVAL_PATH = r"C:\Users\farao\Desktop\Project Smart Net Guard\data_for_multiclasification-20250912T072326Z-1-001\for_l2\L2_trainval_ready_no_bruteforce.parquet"
-DEFAULT_TEST_PATH = r"C:\Users\farao\Desktop\Project Smart Net Guard\data_for_multiclasification-20250912T072326Z-1-001\for_l2\L2_test_ready_no_bruteforce.parquet"
-DEFAULT_OUTPUT_DIR = r"C:\Users\farao\Desktop\Project Smart Net Guard\L2_experiments\l2_dual_input_L2only"
-DEFAULT_L1_RUN = r"C:\Users\farao\Desktop\Project Smart Net Guard\L1_ready_for_working\run_04_09_2025_08-23-48-20250913T075816Z-1-001\run_04_09_2025_08-23-48"
+DEFAULT_TRAINVAL_PATH = r"...\Project Smart Net Guard\data_for_multiclasification-20250912T072326Z-1-001\for_l2\L2_trainval_ready_no_bruteforce.parquet"
+DEFAULT_TEST_PATH = r"...\Project Smart Net Guard\data_for_multiclasification-20250912T072326Z-1-001\for_l2\L2_test_ready_no_bruteforce.parquet"
+DEFAULT_OUTPUT_DIR = r"...\Project Smart Net Guard\L2_experiments\l2_dual_input_L2only"
+DEFAULT_L1_RUN = r"...\Project Smart Net Guard\L1_ready_for_working\run_04_09_2025_08-23-48-20250913T075816Z-1-001\run_04_09_2025_08-23-48"
 
 # ===================== HYPERS/CONSTANTS =====================
 # Basic L2 learning settings
