@@ -45,7 +45,7 @@ DEFAULT_TRAINVAL_PATH = r"...\for_l2\L2_trainval_ready_no_bruteforce.parquet"
 DEFAULT_TEST_PATH     = r"...\for_l2\L2_test_ready_no_bruteforce.parquet"
 DEFAULT_OUTPUT_DIR    = r"...\L2_experiments\l2_dual_input_L2only"
 DEFAULT_L1_RUN        = r"...\L1_ready_for_working\run_04_09_2025_08-23-48\..."
-
+```
 Replace ... with your real paths before running.
 
 Role of L2 in SmartNetGuard
