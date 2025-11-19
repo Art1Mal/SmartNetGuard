@@ -107,15 +107,10 @@ walk_and_preprocess(
 )
 ```
 This will:
-
 * scan raw_parquet_datasets/
-
 * preprocess all files
-
 * keep only BENIGN rows
-
 * select only BASE7 features
-
 * save the results into cleaned_for_L1/
 
 🔧 Example (L2 mode – Supervised classifier)
@@ -128,81 +123,53 @@ walk_and_preprocess(
     l2_keep_labels=["BENIGN", "Bot", "DoS", "PortScan", "Web Attack"]
 )
 This:
-
 * keeps multiple classes
-
 * normalizes all label variants
-
 * removes technical IDs
-
 * produces supervised L2-ready datasets
-
+---
 Functions Overview
 harmonize_feature_names(df)
-
 Maps feature aliases to canonical names.
-
 drop_technical_columns(df)
-
 Removes unsafe identifiers (IP, ports, timestamps).
-
 cast_numeric_columns(df)
-
 Converts all numeric columns to float32; removes non-numeric ones.
-
 clean_nans_and_infs(df)
-
 Replaces inf → NaN and removes rows with NaN.
-
 normalize_labels(df)
-
 Standardizes label spelling and class names.
-
 filter_benign_only(df)
-
 Selects only BENIGN rows and removes label column.
-
 select_base7_features(df)
-
 Keeps only BASE7 features.
-
 preprocess_single_file(path, out_root, mode, ...)
-
 Processes one .parquet and returns its output path.
-
 walk_and_preprocess(in_root, out_root, ...)
-
 Recursively processes an entire directory tree.
-
+---
 Output Files Example
+```
 cleaned_for_L1/
     Thursday-WorkingHours/
         Thursday-WorkingHours_cleaned_float32.parquet
     Friday-Afternoon/
         Friday-Afternoon_cleaned_float32.parquet
-
+```
 All files contain:
-
 * only float32 numeric features
-
 * unified feature names
-
 * no IP/port/timestamp leakage
-
 * no NaNs / no Infs
-
 * optionally BASE7 only
-
+---
 Safety Notes
-
 This script contains no credentials, no API keys, no private device paths, and no sensitive information.
 It is 100% safe for public GitHub publication.
-
+---
 License
-
 This module is released under the MIT License as part of the SmartNetGuard project.
-
+---
 Maintainer
-
 SmartNetGuard Project (L1 + L2 NDR Pipeline)
 Author: Artiom Maliovanii
