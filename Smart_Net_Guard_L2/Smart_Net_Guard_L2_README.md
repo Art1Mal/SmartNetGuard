@@ -263,7 +263,7 @@ Calibrated probabilities are then used on test splits.
 Outputs Overview
 For each run, the output directory contains:
 <output_dir>/
-  run_YYYYMMDD_HHMMSS_win112_seed42/
+  run_YYYYMMDD_HHMMSS_win112_seed42
     SmartNetGuard_L2_DualInput_best.keras
     SmartNetGuard_L2_DualInput_last.keras
     history.json
