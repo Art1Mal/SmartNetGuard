@@ -29,6 +29,7 @@ TEST_PATH  = r"...\Project Smart Net Guard\L1_dataset's\X_test_ready_renamed_cle
 LABEL_PATH = r"...\Project Smart Net Guard\L1_dataset's\y_test_binary_cleaned.parquet"
 
 SAVE_DIR   = r"...\Project Smart Net Guard\L1_ready_for_working"
+```
 Replace the ... placeholders with your actual local paths before running.
 
 Core Concepts
