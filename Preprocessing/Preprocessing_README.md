@@ -66,13 +66,13 @@ This enables consistent multi-class training for L2.
 ### ✔️ 6. BASE7 feature extraction (optional)
 SmartNetGuard’s BASE7 set includes stable metadata features visible even under TLS/HTTPS encryption:
 
-flow_duration
-tot_fwd_pkts
-totlen_fwd_pkts
-fwd_pkt_len_max
-fwd_pkt_len_mean
-flow_iat_mean
-flow_pkts_per_sec
+-flow_duration
+-tot_fwd_pkts
+-totlen_fwd_pkts
+-fwd_pkt_len_max
+-fwd_pkt_len_mean
+-flow_iat_mean
+-flow_pkts_per_sec
 
 Used for both L1 and L2.
 
@@ -180,6 +180,6 @@ It is 100% safe for public GitHub publication.
 License
 This module is released under the MIT License as part of the SmartNetGuard project.
 ---
-Maintainer
-SmartNetGuard Project (L1 + L2 NDR Pipeline)
-Author: Artiom Maliovanii
+-Maintainer
+-SmartNetGuard Project (L1 + L2 NDR Pipeline)
+-Author: Artiom Maliovanii
