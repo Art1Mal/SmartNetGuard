@@ -23,6 +23,7 @@ raw_datasets/
 ├── Bot-IoT/
 └── ... (any other datasets)
 
+---
 ###  2. Feature standardization & renaming
 Different datasets use different column names.  
 Example:  
@@ -30,6 +31,7 @@ Example:
 
 All aliases are merged into a canonical name using `FEATURE_ALIAS_GROUPS`.
 
+---
 ###  3. Removal of technical identifiers
 The following fields are removed automatically:
 - Flow ID  
@@ -43,6 +45,7 @@ These features **cannot** be used for ML security models due to:
 - instability between datasets  
 - zero generalization to encrypted traffic  
 
+---
 ###  4. Label normalization
 Labels are normalized into canonical classes:
 
@@ -56,6 +59,7 @@ Web Attack
 
 This enables consistent multi-class training for L2.
 
+---
 ###  5. Data cleaning
 - Convert all columns → `float32`  
 - Strings → numeric (via `pd.to_numeric`)  
@@ -63,6 +67,7 @@ This enables consistent multi-class training for L2.
 - Replace `inf` / `-inf` → NaN  
 - Drop rows containing NaN  
 
+---
 ###  6. BASE7 feature extraction (optional)
 SmartNetGuard’s BASE7 set includes stable metadata features visible even under TLS/HTTPS encryption:
 
@@ -82,6 +87,7 @@ SmartNetGuard’s BASE7 set includes stable metadata features visible even under
 
 Used for both L1 and L2.
 
+---
 ###  7. BENIGN-only filtering (L1 mode)
 If `mode="l1"`:
 - Only BENIGN traffic is kept  
@@ -89,6 +95,7 @@ If `mode="l1"`:
 
 This prepares clean normal traffic for AutoEncoder anomaly detection.
 
+---
 ###  8. Output structure (per-file subfolders)
 Each input file is saved into:
 
