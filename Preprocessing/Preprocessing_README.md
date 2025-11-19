@@ -129,24 +129,25 @@ This:
 * produces supervised L2-ready datasets
 ---
 Functions Overview
-harmonize_feature_names(df)
+```harmonize_feature_names(df)```
 Maps feature aliases to canonical names.
-drop_technical_columns(df)
+```drop_technical_columns(df)```
 Removes unsafe identifiers (IP, ports, timestamps).
-cast_numeric_columns(df)
+```cast_numeric_columns(df)```
 Converts all numeric columns to float32; removes non-numeric ones.
-clean_nans_and_infs(df)
+```clean_nans_and_infs(df)```
 Replaces inf → NaN and removes rows with NaN.
-normalize_labels(df)
+```normalize_labels(df)```
 Standardizes label spelling and class names.
-filter_benign_only(df)
+```filter_benign_only(df)```
 Selects only BENIGN rows and removes label column.
-select_base7_features(df)
+```select_base7_features(df)```
 Keeps only BASE7 features.
-preprocess_single_file(path, out_root, mode, ...)
+```preprocess_single_file(path, out_root, mode, ...)```
 Processes one .parquet and returns its output path.
-walk_and_preprocess(in_root, out_root, ...)
+```walk_and_preprocess(in_root, out_root, ...)```
 Recursively processes an entire directory tree.
+
 ---
 Output Files Example
 ```
