@@ -188,5 +188,7 @@ License
 This module is released under the MIT License as part of the SmartNetGuard project.
 ---
 -Maintainer
+
 -SmartNetGuard Project (L1 + L2 NDR Pipeline)
+
 -Author: Artiom Maliovanii
