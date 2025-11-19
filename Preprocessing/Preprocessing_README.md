@@ -14,7 +14,7 @@ This module ensures **dataset compatibility**, **feature consistency**, and **cl
 
 ## Key Responsibilities
 
-### ✔️ 1. Recursive dataset traversal
+###  1. Recursive dataset traversal
 The module scans any directory tree and automatically finds **all `.parquet` files**:
 
 raw_datasets/
@@ -23,14 +23,14 @@ raw_datasets/
 ├── Bot-IoT/
 └── ... (any other datasets)
 
-### ✔️ 2. Feature standardization & renaming
+###  2. Feature standardization & renaming
 Different datasets use different column names.  
 Example:  
 `"Flow Duration"`, `"flowDur"`, `"dur"` → **flow_duration**
 
 All aliases are merged into a canonical name using `FEATURE_ALIAS_GROUPS`.
 
-### ✔️ 3. Removal of technical identifiers
+###  3. Removal of technical identifiers
 The following fields are removed automatically:
 - Flow ID  
 - IP addresses  
@@ -43,7 +43,7 @@ These features **cannot** be used for ML security models due to:
 - instability between datasets  
 - zero generalization to encrypted traffic  
 
-### ✔️ 4. Label normalization
+###  4. Label normalization
 Labels are normalized into canonical classes:
 
 BENIGN
@@ -56,14 +56,14 @@ Web Attack
 
 This enables consistent multi-class training for L2.
 
-### ✔️ 5. Data cleaning
+###  5. Data cleaning
 - Convert all columns → `float32`  
 - Strings → numeric (via `pd.to_numeric`)  
 - Non-numeric columns removed  
 - Replace `inf` / `-inf` → NaN  
 - Drop rows containing NaN  
 
-### ✔️ 6. BASE7 feature extraction (optional)
+###  6. BASE7 feature extraction (optional)
 SmartNetGuard’s BASE7 set includes stable metadata features visible even under TLS/HTTPS encryption:
 
 -flow_duration
@@ -82,14 +82,14 @@ SmartNetGuard’s BASE7 set includes stable metadata features visible even under
 
 Used for both L1 and L2.
 
-### ✔️ 7. BENIGN-only filtering (L1 mode)
+###  7. BENIGN-only filtering (L1 mode)
 If `mode="l1"`:
 - Only BENIGN traffic is kept  
 - Label column is removed  
 
 This prepares clean normal traffic for AutoEncoder anomaly detection.
 
-### ✔️ 8. Output structure (per-file subfolders)
+###  8. Output structure (per-file subfolders)
 Each input file is saved into:
 
 cleaned_datasets/
