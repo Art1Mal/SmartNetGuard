@@ -171,6 +171,7 @@ This can be used for anomaly family discovery and potential Zero-Day analysis.
 
 Outputs Overview
 For each run, the script creates a directory:
+```
   <L1_ready_for_working>/
     run_DD_MM_YYYY_HH-MM-SS/
         SmartNetGuard_DeepConv1D_AE.keras
@@ -200,6 +201,7 @@ For each run, the script creates a directory:
             compare_before_after.json
             event_metrics_val_after_ft.json
             event_metrics_final_after_ft.json
+```
 preprocessing_config.json is especially important for the L2 module, as it contains:
 * Feature names
 * Standardization parameters (mean, scale)
@@ -211,10 +213,11 @@ How to Run
 1. Install dependencies (example):
 pip install numpy pandas scikit-learn matplotlib tensorflow keras hdbscan
 2. Adjust paths in the script:
-TRAIN_PATH = r"C:\Users\...\X_train_ready_full_cleaned_float32.parquet"
+```TRAIN_PATH = r"C:\Users\...\X_train_ready_full_cleaned_float32.parquet"
 TEST_PATH  = r"C:\Users\...\X_test_ready_renamed_cleaned_float32.parquet"
 LABEL_PATH = r"C:\Users\...\y_test_binary_cleaned.parquet"
 SAVE_DIR   = r"C:\Users\...\L1_ready_for_working"
+```
 3. Run the script:
 python Smart_Net_Guard_L1.py
   Note: Training is GPU-accelerated if a compatible GPU is available.
