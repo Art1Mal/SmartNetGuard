@@ -120,7 +120,7 @@ This will:
 * save the results into cleaned_for_L1/
 
 🔧 Example (L2 mode – Supervised classifier)
-walk_and_preprocess(
+```walk_and_preprocess(
     in_root="raw_parquet_datasets",
     out_root="cleaned_for_L2",
     mode="l2",
@@ -128,6 +128,7 @@ walk_and_preprocess(
     filter_benign=False,
     l2_keep_labels=["BENIGN", "Bot", "DoS", "PortScan", "Web Attack"]
 )
+```
 This:
 * keeps multiple classes
 * normalizes all label variants
