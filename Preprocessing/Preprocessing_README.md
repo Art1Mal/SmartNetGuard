@@ -67,11 +67,17 @@ This enables consistent multi-class training for L2.
 SmartNetGuard’s BASE7 set includes stable metadata features visible even under TLS/HTTPS encryption:
 
 -flow_duration
+
 -tot_fwd_pkts
+
 -totlen_fwd_pkts
+
 -fwd_pkt_len_max
+
 -fwd_pkt_len_mean
+
 -flow_iat_mean
+
 -flow_pkts_per_sec
 
 Used for both L1 and L2.
