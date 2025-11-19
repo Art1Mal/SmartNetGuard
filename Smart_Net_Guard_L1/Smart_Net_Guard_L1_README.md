@@ -54,7 +54,7 @@ AR-Value
 The script also computes:
 * AR(any-in-window) — label 1 if any attack row appears inside the window
 * AR_trimmed — AR after trimming extreme 1% error values (robust to outliers)
-
+---
 Event-Level Metrics
 Instead of only counting windows, the script groups anomalies into events using connected True-runs in a binary mask:
 * For a given budget b (e.g. 4% of all windows):
@@ -66,7 +66,7 @@ Instead of only counting windows, the script groups anomalies into events using 
     * Time-To-Detect (TTD): median and 95th percentile detection delay from start of each event
 Budget list is controlled via:
   EVENT_BUDGETS_TO_REPORT = [0.04]  # e.g. 4% top windows
-
+---
 Model Architecture
 The autoencoder is a deep Conv1D encoder–decoder with:
 * 4 Conv1D encoder blocks:
@@ -88,7 +88,7 @@ Training details:
   * Huber loss with delta = HUBER_DELTA (robust to outliers)
 * Normalization:
   * LayerNorm (default) or BatchNorm controlled by USE_LAYER_NORM****
-
+---
 Training Pipeline
 1. Load data from TRAIN_PATH, TEST_PATH, LABEL_PATH
 2. Standardize features with StandardScaler (fit on train, apply to test)
@@ -109,7 +109,7 @@ Training Pipeline
   * hyperparams.json
   * train_history.json
   * train_curve.png (loss/val_loss)
-
+---
 Evaluation Pipeline
 1. Build sliding windows over test data:
   * stride = 1, no shuffling
@@ -133,7 +133,7 @@ Evaluation Pipeline
   * diagnostics.json
   * event_metrics_val.json
   * event_metrics_final.json
-
+---
 Fine-Tuning on “Hard Normals”
 If FINETUNE_ENABLED = True, the script performs an additional training stage:
 1. Identify windows that are:
@@ -151,7 +151,7 @@ If FINETUNE_ENABLED = True, the script performs an additional training stage:
   * compare_before_after.json (AR before vs after)
   * Extra event-level metrics: *_after_ft.json
 This helps the model better reconstruct borderline normal windows without overfitting to attacks.
-
+---
 Clustering of En4 Embeddings
 The script also explores the structure of anomalies in latent space:
 1. Extract embeddings from layer "En4" for a subsample of final windows
@@ -168,7 +168,7 @@ The script also explores the structure of anomalies in latent space:
   * hdbscan_cluster_stats.json — summary
   * hdbscan_pca_subset.png — 2D PCA visualization colored by cluster
 This can be used for anomaly family discovery and potential Zero-Day analysis.
-
+---
 Outputs Overview
 For each run, the script creates a directory:
 ```
@@ -208,7 +208,7 @@ preprocessing_config.json is especially important for the L2 module, as it conta
 * Z-clip range
 * Window size
 * Error metric name
-
+---
 How to Run
 1. Install dependencies (example):
 pip install numpy pandas scikit-learn matplotlib tensorflow keras hdbscan
@@ -227,10 +227,10 @@ Safety Notes
 * The script does not contain any secrets, credentials or private tokens.
 * All paths in the repo use either placeholders (...) or generic local directories.
 * It is safe to publish this file and its README on GitHub as part of a public portfolio project.
-
+---
 License
 This module is distributed under the MIT License as part of the SmartNetGuard project.
-
+---
 Maintainer
 SmartNetGuard — Network Threat Detection Pipeline (L1 + L2)
 Author: Artiom Maliovanii
