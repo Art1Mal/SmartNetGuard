@@ -87,6 +87,23 @@ Turns packets into **uniform flow-time windows**, producing exactly the feature 
 - Rates: **flow_pkts_per_sec**
 - TLS: **SNI**, **ALPN**, **JA3 raw**
 
+---
+## 📦 Dependencies
+
+SmartNetGuard requires the following core libraries:
+
+- **NumPy** — numerical operations for packet/flow statistics.
+- **Pandas** — tabular data processing for flow windows.
+- **SciPy** — additional numerical utilities.
+- **TensorFlow / Keras** — L1 AutoEncoder & L2 Classifier inference.
+- **PyQt6** — GUI framework for real-time visualization and controls.
+- **PyQtGraph** — high-performance plotting (reconstruction error bar-graph).
+- **Scapy** — optional packet parsing for LIVE sniffer mode.
+- **Matplotlib** — used internally for snapshots and event artifacts.
+- **psutil** — system information helper for runner utilities.
+
+All dependencies are listed in `requirements.txt`.
+---
 ### Why it is important:
 It ensures **deterministic**, **dataset-agnostic**, **runner-compatible** feature formatting.
 
@@ -174,7 +191,7 @@ python SmartNetGuard_GUI.py
 ---
 ## 3) Run inference on a PCAP
 ```
-python Smart_Net_Guard_Run_2.py \
+python Smart_Net_Guard_Run.py \
     --source pcap \
     --pcap path/to/file.pcap \
     --l1_run L1_ready_for_working/run_xxx \
@@ -186,7 +203,7 @@ python Smart_Net_Guard_Run_2.py \
 ---
 ## 4) Run in LIVE mode
 ```
-python Smart_Net_Guard_Run_2.py \
+python Smart_Net_Guard_Run.py \
     --source sniffer \
     --iface Ethernet \
     --l1_run L1_ready_for_working/run_xxx \
