@@ -1,4 +1,4 @@
-# 🚀 SmartNetGuard — Quick Demo (for recruiters)
+# 🚀 SmartNetGuard — Quick Demo 
 
 SmartNetGuard is an AI-based system that analyzes network traffic (PCAP files) 
 and detects cyber attacks in real-time.
